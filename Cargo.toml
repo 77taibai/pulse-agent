@@ -1,0 +1,32 @@
+[package]
+name = "pulse-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Lightweight server metrics agent for the Pulse monitoring panel"
+license = "MIT"
+
+[[bin]]
+name = "pulse-agent"
+path = "src/main.rs"
+
+[dependencies]
+# The only third-party dependency.
+#
+# `ring` is used instead of `aws-lc-rs` because it needs no CMake/NASM toolchain,
+# which keeps cross-compilation (notably to x86_64-unknown-linux-musl) working out
+# of the box and the resulting binary small.
+#
+# Default features are disabled so the crate graph stays minimal; `std` and `tls12`
+# are re-enabled explicitly. Because the `aws_lc_rs` default provider is therefore
+# absent, the code always builds its `ClientConfig` via `builder_with_provider`.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+# Mozilla's bundled root CA store, so the agent does not depend on the host having
+# a usable /etc/ssl/certs bundle.
+webpki-roots = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
