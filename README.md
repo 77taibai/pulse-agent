@@ -7,8 +7,6 @@
 - 纯标准库实现 HTTP/1.1、JSON、指标采集（Linux 走 `/proc`，Windows 走 Win32 FFI）
 - 支持一键安装为系统后台服务（Linux systemd / Windows SCM）
 
-接口契约见仓库内的 [`PULSE-API.md`](./PULSE-API.md)。
-
 ---
 
 ## 目录
@@ -237,8 +235,10 @@ PrivateTmp=true
 1. 复制程序到 `%ProgramFiles%\PulseAgent\pulse-agent.exe`；
 2. 通过 SCM API 创建服务（服务名 `PulseAgent`，显示名 `Pulse Agent`，自动启动）；
 3. 将配置写入服务注册表 `HKLM\SYSTEM\CurrentControlSet\Services\<服务名>\Environment`（`REG_MULTI_SZ`）；
-4. 默认日志文件为 `<安装目录>\pulse-agent.log`；
-5. 启动服务。
+4. 将安装目录追加到系统 `PATH`（`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`），
+   已存在则跳过；并广播 `WM_SETTINGCHANGE`，新开的终端可直接调用 `pulse-agent`；
+5. 默认日志文件为 `<安装目录>\pulse-agent.log`；
+6. 启动服务。
 
 服务进程通过手写的 `StartServiceCtrlDispatcherW` 派发器接入 SCM；直接双击或命令行启动同一程序时会自动回落到前台模式。
 
@@ -248,6 +248,18 @@ PrivateTmp=true
 .\pulse-agent.exe start
 .\pulse-agent.exe restart
 ```
+
+`status` 在 Linux 与 Windows 上输出统一格式：
+
+```text
+服务: PulseAgent
+状态: 运行中 (running)
+PID:  1234
+程序: /usr/local/bin/pulse-agent
+```
+
+状态取值统一为 `running` / `stopped` / `start_pending` / `stop_pending` / `paused` / `failed` / `unknown`；
+未安装（服务不存在）时两个平台都会报“服务不存在（尚未安装）”。
 
 ---
 
@@ -263,7 +275,7 @@ sudo ./pulse-agent uninstall        # Linux
 
 - **Linux**：停止并禁用服务，删除 unit 文件，执行 `daemon-reload`，删除 `/usr/local/bin/pulse-agent`。
   仅当显式使用了 `--install-dir` 时，才尝试删除该（已空的）目录，绝不递归删除共享目录。
-- **Windows**：停止并删除服务，递归删除安装目录及其中所有文件。
+- **Windows**：停止并删除服务，从系统 `PATH` 移除安装目录，递归删除安装目录及其中所有文件。
   - 安全护栏：拒绝删除盘符根、`Program Files`、`Windows`、`System32`、`Users`、`ProgramData` 等路径；
     且仅当目录中存在 `pulse-agent.exe` 时才执行删除。
   - 若当前运行的程序正位于该目录（文件被占用），会启动一个延迟助手，在进程退出后完成删除。

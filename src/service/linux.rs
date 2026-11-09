@@ -1,4 +1,4 @@
-﻿//! systemd integration.
+//! systemd integration.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use crate::agent::{self, Agent};
 use crate::cli::{Config, BIN_NAME};
 use crate::util::{run_command, run_command_checked};
+
+use super::{ServiceState, StatusReport};
 
 const DEFAULT_BIN_DIR: &str = "/usr/local/bin";
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
@@ -122,15 +124,76 @@ pub fn status(cfg: &Config) -> Result<(), String> {
     let service = format!("{}.service", cfg.service_name);
     let out = run_command(
         "systemctl",
-        &["status", service.as_str(), "--no-pager", "-l"],
+        &[
+            "show",
+            service.as_str(),
+            "--no-pager",
+            "--property=LoadState,ActiveState,MainPID,ExecStart",
+        ],
     )?;
-    if !out.stdout.is_empty() {
-        println!("{}", out.stdout);
+    if !out.success {
+        return Err(format!(
+            "查询服务状态失败: {}",
+            if out.stderr.is_empty() {
+                out.stdout
+            } else {
+                out.stderr
+            }
+        ));
     }
-    if !out.stderr.is_empty() {
-        println!("{}", out.stderr);
+
+    let mut load_state = String::new();
+    let mut active_state = String::new();
+    let mut pid: u32 = 0;
+    let mut exec_start = String::new();
+    for line in out.stdout.lines() {
+        let (key, value) = match line.split_once('=') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        match key {
+            "LoadState" => load_state = value.trim().to_string(),
+            "ActiveState" => active_state = value.trim().to_string(),
+            "MainPID" => pid = value.trim().parse().unwrap_or(0),
+            "ExecStart" => exec_start = value.trim().to_string(),
+            _ => {}
+        }
     }
+
+    if load_state == "not-found" {
+        return Err(format!("服务 {} 不存在（尚未安装）", cfg.service_name));
+    }
+
+    let state = match active_state.as_str() {
+        "active" | "reloading" => ServiceState::Running,
+        "activating" => ServiceState::StartPending,
+        "deactivating" => ServiceState::StopPending,
+        "inactive" => ServiceState::Stopped,
+        "failed" => ServiceState::Failed,
+        _ => ServiceState::Unknown,
+    };
+
+    StatusReport {
+        service: &cfg.service_name,
+        state,
+        pid: Some(pid),
+        binary: exec_start_path(&exec_start),
+    }
+    .print();
     Ok(())
+}
+
+/// Extract the executable path from systemd's `ExecStart={ path=... ; args }`.
+fn exec_start_path(exec_start: &str) -> Option<String> {
+    let start = exec_start.find("path=")? + "path=".len();
+    let rest = &exec_start[start..];
+    let end = rest.find(" ;").or_else(|| rest.find(';')).unwrap_or(rest.len());
+    let path = rest[..end].trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
 }
 
 fn unit_path(service_name: &str) -> PathBuf {

@@ -15,12 +15,23 @@ use crate::agent::Agent;
 use crate::cli::{Config, BIN_NAME};
 use crate::log;
 
+use super::{ServiceState, StatusReport};
+
 type Handle = *mut c_void;
 type Hkey = isize;
 
 const HKEY_LOCAL_MACHINE: Hkey = 0x8000_0002u32 as i32 as isize;
+const KEY_QUERY_VALUE: u32 = 0x0001;
 const KEY_SET_VALUE: u32 = 0x0002;
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
 const REG_MULTI_SZ: u32 = 7;
+
+const HWND_BROADCAST: Handle = 0xFFFF_usize as Handle;
+const WM_SETTINGCHANGE: u32 = 0x001A;
+const SMTO_ABORTIFHUNG: u32 = 0x0002;
+
+const SYSTEM_ENV_KEY: &str = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
 
 const SC_MANAGER_CONNECT: u32 = 0x0001;
 const SC_MANAGER_ALL_ACCESS: u32 = 0xF003F;
@@ -135,6 +146,14 @@ extern "system" {
         sam: u32,
         out: *mut Hkey,
     ) -> i32;
+    fn RegQueryValueExW(
+        hkey: Hkey,
+        value_name: *const u16,
+        reserved: *mut u32,
+        value_type: *mut u32,
+        data: *mut u8,
+        data_len: *mut u32,
+    ) -> i32;
     fn RegSetValueExW(
         hkey: Hkey,
         value_name: *const u16,
@@ -144,6 +163,19 @@ extern "system" {
         data_len: u32,
     ) -> i32;
     fn RegCloseKey(hkey: Hkey) -> i32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn SendMessageTimeoutW(
+        hwnd: Handle,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+        flags: u32,
+        timeout: u32,
+        result: *mut usize,
+    ) -> isize;
 }
 
 #[link(name = "kernel32")]
@@ -366,6 +398,20 @@ pub fn install(cfg: &Config) -> Result<(), String> {
         println!("日志文件: {}", log);
     }
 
+    // Make `pulse-agent` callable from any new shell, mirroring Linux where the
+    // binary lands in /usr/local/bin (already on PATH).
+    if let Some(parent) = dest.parent() {
+        match install_path_entry(parent) {
+            Ok(true) => println!("已加入系统 PATH: {}", parent.display()),
+            Ok(false) => println!("系统 PATH 已包含: {}", parent.display()),
+            Err(err) => println!(
+                "警告: 写入系统 PATH 失败，请手动添加 {}: {}",
+                parent.display(),
+                err
+            ),
+        }
+    }
+
     start(cfg)?;
     Ok(())
 }
@@ -383,6 +429,7 @@ pub fn uninstall(cfg: &Config) -> Result<(), String> {
         Ok(())
     })?;
 
+    remove_path_entry(&install_dir(cfg));
     remove_install_dir(cfg);
     println!("已删除服务: {}", cfg.service_name);
     Ok(())
@@ -486,7 +533,7 @@ pub fn restart(cfg: &Config) -> Result<(), String> {
 }
 
 pub fn status(cfg: &Config) -> Result<(), String> {
-    with_service(cfg, SERVICE_QUERY_STATUS, |service| {
+    let (state, pid) = with_service(cfg, SERVICE_QUERY_STATUS, |service| {
         let mut buffer = ServiceStatusProcess::default();
         let mut needed: u32 = 0;
         let ok = unsafe {
@@ -504,23 +551,108 @@ pub fn status(cfg: &Config) -> Result<(), String> {
                 unsafe { GetLastError() }
             ));
         }
-        println!("服务: {}", cfg.service_name);
-        println!("状态: {}", state_name(buffer.current_state));
-        println!("PID:  {}", buffer.process_id);
-        Ok(())
-    })
+        Ok((map_state(buffer.current_state), buffer.process_id))
+    })?;
+
+    StatusReport {
+        service: &cfg.service_name,
+        state,
+        pid: Some(pid),
+        binary: read_service_image(&cfg.service_name),
+    }
+    .print();
+    Ok(())
 }
 
-fn state_name(state: u32) -> &'static str {
+fn map_state(state: u32) -> ServiceState {
     match state {
-        SERVICE_STOPPED => "已停止 (stopped)",
-        SERVICE_START_PENDING => "正在启动 (start_pending)",
-        SERVICE_STOP_PENDING => "正在停止 (stop_pending)",
-        SERVICE_RUNNING => "运行中 (running)",
-        SERVICE_CONTINUE_PENDING => "正在恢复 (continue_pending)",
-        SERVICE_PAUSE_PENDING => "正在暂停 (pause_pending)",
-        SERVICE_PAUSED => "已暂停 (paused)",
-        _ => "未知",
+        SERVICE_STOPPED => ServiceState::Stopped,
+        SERVICE_START_PENDING | SERVICE_CONTINUE_PENDING => ServiceState::StartPending,
+        SERVICE_STOP_PENDING | SERVICE_PAUSE_PENDING => ServiceState::StopPending,
+        SERVICE_RUNNING => ServiceState::Running,
+        SERVICE_PAUSED => ServiceState::Paused,
+        _ => ServiceState::Unknown,
+    }
+}
+
+/// Read `ImagePath` from the service's registry key so `status` can show the
+/// installed executable, matching the Linux output.
+fn read_service_image(service_name: &str) -> Option<String> {
+    let sub_key = to_wide(&format!(
+        "SYSTEM\\CurrentControlSet\\Services\\{}",
+        service_name
+    ));
+    let mut hkey: Hkey = 0;
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut hkey,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+
+    let value_name = to_wide("ImagePath");
+    let mut value_type: u32 = 0;
+    let mut len: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            std::ptr::null_mut(),
+            &mut len,
+        )
+    };
+    if rc != 0 || len == 0 {
+        unsafe {
+            RegCloseKey(hkey);
+        }
+        return None;
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    unsafe {
+        RegCloseKey(hkey);
+    }
+    if rc != 0 || (value_type != REG_SZ && value_type != REG_EXPAND_SZ) {
+        return None;
+    }
+
+    let units: Vec<u16> = buf[..len as usize]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let raw = String::from_utf16_lossy(&units);
+    normalize_image_path(raw.trim_matches('\0').trim())
+}
+
+/// Turn `"C:\...\pulse-agent.exe" run` into a bare executable path.
+fn normalize_image_path(raw: &str) -> Option<String> {
+    let mut path = raw.trim();
+    if let Some(stripped) = path.strip_suffix(" run") {
+        path = stripped.trim_end();
+    }
+    let path = path.trim_matches('"').trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
     }
 }
 
@@ -614,6 +746,214 @@ fn same_path(a: &PathBuf, b: &PathBuf) -> bool {
         _ => a == b,
     }
 }
+
+// ---------------------------------------------------------------------------
+// System PATH management (so `pulse-agent` works from any shell after install)
+// ---------------------------------------------------------------------------
+
+fn normalize_dir(dir: &std::path::Path) -> String {
+    dir.to_string_lossy()
+        .trim()
+        .trim_matches('"')
+        .trim_end_matches(|c| c == '\\' || c == '/')
+        .to_string()
+}
+
+fn same_dir(candidate: &str, target: &str) -> bool {
+    let candidate = candidate
+        .trim()
+        .trim_matches('"')
+        .trim_end_matches(|c| c == '\\' || c == '/');
+    candidate.eq_ignore_ascii_case(target)
+}
+
+fn path_contains(current: &str, dir: &str) -> bool {
+    current.split(';').any(|entry| same_dir(entry, dir))
+}
+
+/// Append `dir` to the machine-wide `PATH`. Returns `true` when it was added,
+/// `false` when it was already present.
+fn install_path_entry(dir: &std::path::Path) -> Result<bool, String> {
+    let dir = normalize_dir(dir);
+    if dir.is_empty() {
+        return Ok(false);
+    }
+    let (mut current, value_type) = read_system_path()?;
+    if path_contains(&current, &dir) {
+        return Ok(false);
+    }
+    if !current.is_empty() && !current.ends_with(';') {
+        current.push(';');
+    }
+    current.push_str(&dir);
+    write_system_path(&current, value_type)?;
+    broadcast_environment_change();
+    Ok(true)
+}
+
+/// Remove `dir` from the machine-wide `PATH` if present.
+fn remove_path_entry(dir: &std::path::Path) {
+    let dir = normalize_dir(dir);
+    if dir.is_empty() {
+        return;
+    }
+    let (current, value_type) = match read_system_path() {
+        Ok(pair) => pair,
+        Err(_) => return,
+    };
+    let entries: Vec<&str> = current.split(';').collect();
+    if !entries.iter().any(|entry| same_dir(entry, &dir)) {
+        return;
+    }
+    let updated: Vec<&str> = entries
+        .into_iter()
+        .filter(|entry| !same_dir(entry, &dir))
+        .collect();
+    let updated = updated.join(";");
+    if write_system_path(&updated, value_type).is_ok() {
+        broadcast_environment_change();
+        println!("已从系统 PATH 移除: {}", dir);
+    }
+}
+
+fn read_system_path() -> Result<(String, u32), String> {
+    let sub_key = to_wide(SYSTEM_ENV_KEY);
+    let mut hkey: Hkey = 0;
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            &mut hkey,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "打开系统环境变量注册表项失败，错误码 {}{}",
+            rc,
+            admin_hint(rc as u32)
+        ));
+    }
+
+    let value_name = to_wide("Path");
+    let mut value_type: u32 = 0;
+    let mut len: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            std::ptr::null_mut(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        unsafe {
+            RegCloseKey(hkey);
+        }
+        if rc == ERROR_FILE_NOT_FOUND as i32 {
+            return Ok((String::new(), REG_EXPAND_SZ));
+        }
+        return Err(format!("读取系统 PATH 失败，错误码 {}", rc));
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    unsafe {
+        RegCloseKey(hkey);
+    }
+    if rc != 0 {
+        return Err(format!("读取系统 PATH 失败，错误码 {}", rc));
+    }
+
+    let units: Vec<u16> = buf[..len as usize]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let text = String::from_utf16_lossy(&units);
+    Ok((text.trim_end_matches('\0').to_string(), value_type))
+}
+
+fn write_system_path(value: &str, value_type: u32) -> Result<(), String> {
+    let sub_key = to_wide(SYSTEM_ENV_KEY);
+    let mut hkey: Hkey = 0;
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut hkey,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "打开系统环境变量注册表项失败，错误码 {}{}",
+            rc,
+            admin_hint(rc as u32)
+        ));
+    }
+
+    let units: Vec<u16> = value.encode_utf16().collect();
+    let mut bytes: Vec<u8> = Vec::with_capacity(units.len() * 2);
+    for unit in &units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    let value_name = to_wide("Path");
+    let ty = if value_type == REG_SZ {
+        REG_SZ
+    } else {
+        REG_EXPAND_SZ
+    };
+    let rc = unsafe {
+        RegSetValueExW(
+            hkey,
+            value_name.as_ptr(),
+            0,
+            ty,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    };
+    unsafe {
+        RegCloseKey(hkey);
+    }
+    if rc != 0 {
+        return Err(format!("写入系统 PATH 失败，错误码 {}", rc));
+    }
+    Ok(())
+}
+
+/// Tell running processes (notably Explorer) that the environment changed.
+fn broadcast_environment_change() {
+    let target = to_wide("Environment");
+    let mut result: usize = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            target.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut result,
+        );
+    }
+}
+
+const ERROR_FILE_NOT_FOUND: u32 = 2;
 
 fn set_service_environment(
     service_name: &str,
@@ -719,5 +1059,25 @@ mod tests {
         assert!(!safe_to_remove(&PathBuf::from("C:\\ProgramData")));
         assert!(safe_to_remove(&PathBuf::from("C:\\Program Files\\PulseAgent")));
         assert!(safe_to_remove(&PathBuf::from("C:\\PulseAgent")));
+    }
+
+    #[test]
+    fn normalizes_service_image_path() {
+        assert_eq!(
+            normalize_image_path("\"C:\\Program Files\\PulseAgent\\pulse-agent.exe\" run"),
+            Some("C:\\Program Files\\PulseAgent\\pulse-agent.exe".to_string())
+        );
+        assert_eq!(
+            normalize_image_path("\"C:\\Program Files\\PulseAgent\\pulse-agent.exe\""),
+            Some("C:\\Program Files\\PulseAgent\\pulse-agent.exe".to_string())
+        );
+        assert_eq!(normalize_image_path("   "), None);
+    }
+
+    #[test]
+    fn detects_path_entries_case_insensitively() {
+        let path = "C:\\Windows;C:\\Program Files\\PulseAgent\\";
+        assert!(path_contains(path, "c:\\program files\\pulseagent"));
+        assert!(!path_contains(path, "C:\\Program Files\\Other"));
     }
 }
